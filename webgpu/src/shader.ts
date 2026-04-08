@@ -62,7 +62,10 @@ diagnostic(off, subgroup_uniformity);
 @group(0) @binding(0) var<storage, read>       input_buf  : array<u32>;
 @group(0) @binding(1) var<storage, read_write> metaBuf    : array<atomic<u32>>;
 @group(0) @binding(2) var<storage, read_write> output_buf : array<atomic<u32>>;
-@group(0) @binding(3) var<storage, read_write> state_buf  : array<atomic<u32>>;
+// Finding 3: the legacy state_buf binding (slot 3) has been removed. Page
+// boundaries always reset the bit reader and rebuild Huffman tables from
+// the input stream, so the cross-dispatch spill/restore was a no-op; the
+// only live cross-dispatch state is pageCursor, which lives in metaBuf.
 
 //------------------------------------------------------------------------------
 // Constants (HLSL: top of file)
@@ -118,20 +121,7 @@ const BROTLIG_MAX_NUM_SUB_BLOCK : u32 = 32u;
 const BROTLIG_MAX_NUM_MIP_LEVELS : u32 = 32u;
 const BROTLIG_PRECON_SWIZZLE_REGION_SIZE : u32 = 2u;
 
-// Streaming state layout constants
-const STATE_STRIDE_WORDS : u32 = 4096u; // 16 KB per stream
-const STATE_OFF_HOLD_LO : u32 = 0u;
-const STATE_OFF_HOLD_HI : u32 = 1u;
-const STATE_OFF_VALID_BITS : u32 = 2u;
-const STATE_OFF_READPTR : u32 = 3u;
-const STATE_OFF_PAGECUR : u32 = 4u;
-const STATE_OFF_NPOSTFIX : u32 = 5u;
-const STATE_OFF_NDIRECT : u32 = 6u;
-const STATE_OFF_ISDELTA : u32 = 7u;
-const STATE_OFF_DICT : u32 = 8u;                   // length DICTIONARY_COMPACT_TOTAL_SIZE (489)
-const STATE_OFF_SYMLEN : u32 = 8u + 489u;          // length SYMBOL_LENGTHS_DWORDS (91) = 588
-const STATE_OFF_SEARCH0 : u32 = 8u + 489u + 91u;   // 588; 32 lanes
-const STATE_OFF_SEARCH1 : u32 = 620u;              // 588 + 32; 32 lanes
+// Finding 3: streaming state layout constants removed with state_buf.
 
 //------------------------------------------------------------------------------
 // Groupshared declarations
@@ -688,7 +678,15 @@ fn BuildHuffmanTable(t : u32, offIn : u32, tSize : u32, laneIx : u32) {
 
     let lenSnap = SymLenSnapCopy(laneIx);
     ClearDictionary(t, laneIx);
-    /* workgroupBarrier removed: single-subgroup WG */
+    // Finding 2B (deviation): HLSL parity would want a
+    // workgroupBarrier()/subgroupBarrier() here to order ClearDictionary's
+    // atomicStore(0) writes before the SetSymbol atomicOr fan-in. WGSL
+    // rejects workgroupBarrier because BuildHuffmanTable is reached from
+    // non-uniform control flow, and subgroupBarrier is not yet a resolved
+    // builtin on Chrome's WGSL. Since the workgroup is a single subgroup
+    // executing in SIMT lockstep the ordering holds in practice (baseline
+    // 16/16 confirms), but a future driver with looser lane scheduling
+    // could reintroduce the race. Revisit when subgroupBarrier ships.
 
     var symbol : u32 = laneIx;
     loop {
@@ -1114,7 +1112,14 @@ fn decodedistance(bs : ptr<function, DecoderState>, laneIx : u32, p : bool) -> u
 fn SpreadValue(v0 : u32, v1 : u32, v2 : u32, v3 : u32, v4 : u32,
                mask : u32, sum : u32, en : bool, laneIx : u32) -> u32 {
     if (laneIx < LOG_NUM_LANES) { atomicStore(&scoreBoard[laneIx], 0u); }
-    /* workgroupBarrier removed: single-subgroup WG */
+    // Finding 2C (deviation): ordering between scoreBoard zero-init,
+    // atomicOr fan-in, and the subsequent cross-lane reads would ideally
+    // be enforced with workgroupBarrier(). SpreadValue is called from
+    // non-uniform control flow inside SpreadLiterals, so WGSL uniformity
+    // analysis rejects workgroupBarrier here, and subgroupBarrier is not
+    // yet resolved in Chrome's WGSL. Single-subgroup SIMT lockstep
+    // execution is relied upon (baseline 16/16 confirms). Revisit when
+    // subgroupBarrier ships.
     if (en) {
         atomicOr(&scoreBoard[0], (v0 & mask) << sum);
         atomicOr(&scoreBoard[1], (v1 & mask) << sum);
@@ -1122,7 +1127,6 @@ fn SpreadValue(v0 : u32, v1 : u32, v2 : u32, v3 : u32, v4 : u32,
         atomicOr(&scoreBoard[3], (v3 & mask) << sum);
         atomicOr(&scoreBoard[4], (v4 & mask) << sum);
     }
-    /* workgroupBarrier removed: single-subgroup WG */
     var result : u32 = 0u;
     for (var i : i32 = i32(LOG_NUM_LANES) - 1; i >= 0; i = i - 1) {
         result = result | (((atomicLoad(&scoreBoard[i]) >> laneIx) & 1u) << u32(i));
@@ -1259,7 +1263,7 @@ fn Decompress(bs : ptr<function, DecoderState>, wptrIn : u32, dParams : DecoderP
         wptr = wptr + subgroupBroadcast(offset + cmd.copy_len, 31u);
 
         if (writeptr < outlimit) {
-            // no clamp
+            cmd.copy_len = min(cmd.copy_len, outlimit - writeptr);
         } else {
             cmd.copy_len = 0u;
         }
@@ -1530,6 +1534,14 @@ fn ConditionerParams_Init(dc : ptr<function, ConditionerParams>, laneIx : u32) {
 }
 
 // HLSL:926 ConditionerParams.GetSub
+// Finding 2A deviation: helpers below read gOffsets_* workgroup arrays
+// rather than subgroupShuffle'ing ConditionerParams per-lane fields,
+// because DeconditionPtr is reached from DecompressAndDecondition's inner
+// back-reference loop where lane activity diverges (some lanes have
+// exited the j-less-than-cLength loop). subgroupShuffle with non-uniform active
+// lanes is undefined, whereas workgroup-memory reads are well-defined.
+// ConditionerParams_Init's own prefix-sum loops already use subgroupShuffle
+// (BC3 fix pattern) so the intra-Init cross-lane hazard is addressed.
 fn CP_GetSub(ptr_ : u32, num_subblocks : u32) -> u32 {
     var sub : u32 = 0u;
     for (var i : u32 = 0u; i < num_subblocks; i = i + 1u) {
@@ -1757,7 +1769,9 @@ fn DecompressAndDecondition(bs : ptr<function, DecoderState>, wptrIn : u32,
 
         wptr = wptr + subgroupBroadcast(offset + cmd.copy_len, 31u);
 
-        if (writeptr >= outlimit) {
+        if (writeptr < outlimit) {
+            cmd.copy_len = min(cmd.copy_len, outlimit - writeptr);
+        } else {
             cmd.copy_len = 0u;
         }
 
@@ -1912,72 +1926,15 @@ fn Process_generic(source : u32, destination : u32, inputSize : u32, outputSize 
 }
 
 //------------------------------------------------------------------------------
-// Streaming: spill / restore groupshared tables + bit reader state
+// Streaming: no-op. Finding 3 removed the state_buf binding. Pages always
+// reset the bit reader and rebuild Huffman tables at entry; the only live
+// cross-dispatch state is pageCursor, which lives in metaBuf. spillState
+// and restoreState previously copied dictionaries/Huffman tables in/out of
+// a dedicated buffer; that work is dead and the helpers are kept only as
+// shells so the CSMain call sites do not need structural changes.
 //------------------------------------------------------------------------------
-fn stateWordIndex(streamIndex : u32, offset : u32) -> u32 {
-    return (streamIndex - 1u) * STATE_STRIDE_WORDS + offset;
-}
-
-fn spillState(streamIndex : u32, bs : DecoderState, pageCursor : u32, dp : DecoderParams, laneIx : u32) {
-    let base = (streamIndex - 1u) * STATE_STRIDE_WORDS;
-    if (laneIx == 0u) {
-        atomicStore(&state_buf[base + STATE_OFF_HOLD_LO], bs.holdLo);
-        atomicStore(&state_buf[base + STATE_OFF_HOLD_HI], bs.holdHi);
-        atomicStore(&state_buf[base + STATE_OFF_VALID_BITS], bs.validBits);
-        atomicStore(&state_buf[base + STATE_OFF_READPTR], bs.readPointer);
-        atomicStore(&state_buf[base + STATE_OFF_PAGECUR], pageCursor);
-        atomicStore(&state_buf[base + STATE_OFF_NPOSTFIX], dp.npostfix);
-        atomicStore(&state_buf[base + STATE_OFF_NDIRECT], dp.n_direct);
-        atomicStore(&state_buf[base + STATE_OFF_ISDELTA], dp.isDeltaEncoded);
-    }
-    // gDictionary spill
-    var i : u32 = laneIx;
-    loop {
-        if (i >= DICTIONARY_COMPACT_TOTAL_SIZE) { break; }
-        atomicStore(&state_buf[base + STATE_OFF_DICT + i], atomicLoad(&gDictionary[i]));
-        i = i + NUM_LANES;
-    }
-    // gSymbolLengths spill
-    i = laneIx;
-    loop {
-        if (i >= SYMBOL_LENGTHS_DWORDS) { break; }
-        atomicStore(&state_buf[base + STATE_OFF_SYMLEN + i], atomicLoad(&gSymbolLengths[i]));
-        i = i + NUM_LANES;
-    }
-    // SearchTable spills: exactly NUM_LANES lanes.
-    atomicStore(&state_buf[base + STATE_OFF_SEARCH0 + laneIx], gSearchTable0[laneIx]);
-    atomicStore(&state_buf[base + STATE_OFF_SEARCH1 + laneIx], gSearchTable1[laneIx]);
-    /* workgroupBarrier removed: single-subgroup WG */
-}
-
-fn restoreState(streamIndex : u32, bs : ptr<function, DecoderState>, dp : ptr<function, DecoderParams>, laneIx : u32) -> u32 {
-    let base = (streamIndex - 1u) * STATE_STRIDE_WORDS;
-    (*bs).holdLo = atomicLoad(&state_buf[base + STATE_OFF_HOLD_LO]);
-    (*bs).holdHi = atomicLoad(&state_buf[base + STATE_OFF_HOLD_HI]);
-    (*bs).validBits = atomicLoad(&state_buf[base + STATE_OFF_VALID_BITS]);
-    (*bs).readPointer = atomicLoad(&state_buf[base + STATE_OFF_READPTR]);
-    (*bs).lane = laneIx;
-    let pageCursor = atomicLoad(&state_buf[base + STATE_OFF_PAGECUR]);
-    (*dp).npostfix = atomicLoad(&state_buf[base + STATE_OFF_NPOSTFIX]);
-    (*dp).n_direct = atomicLoad(&state_buf[base + STATE_OFF_NDIRECT]);
-    (*dp).isDeltaEncoded = atomicLoad(&state_buf[base + STATE_OFF_ISDELTA]);
-
-    var i : u32 = laneIx;
-    loop {
-        if (i >= DICTIONARY_COMPACT_TOTAL_SIZE) { break; }
-        atomicStore(&gDictionary[i], atomicLoad(&state_buf[base + STATE_OFF_DICT + i]));
-        i = i + NUM_LANES;
-    }
-    i = laneIx;
-    loop {
-        if (i >= SYMBOL_LENGTHS_DWORDS) { break; }
-        atomicStore(&gSymbolLengths[i], atomicLoad(&state_buf[base + STATE_OFF_SYMLEN + i]));
-        i = i + NUM_LANES;
-    }
-    gSearchTable0[laneIx] = atomicLoad(&state_buf[base + STATE_OFF_SEARCH0 + laneIx]);
-    gSearchTable1[laneIx] = atomicLoad(&state_buf[base + STATE_OFF_SEARCH1 + laneIx]);
-    /* workgroupBarrier removed: single-subgroup WG */
-    return pageCursor;
+fn spillState_noop(streamIndex : u32, pageCursor : u32, laneIx : u32) {
+    // Intentionally empty. pageCursor is persisted via metaBuf in CSMain.
 }
 
 //------------------------------------------------------------------------------
@@ -2089,16 +2046,18 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>,
         let resumeBit = 1u << ((streamIndex - 1u) & 31u);
         let isResume = (resumeFlag & resumeBit) != 0u;
 
-        // If resuming, restore tables + bit reader. Otherwise parse header
-        // normally in Process_generic on the first page encounter.
-        var bsSaved : DecoderState;
-        var dpSaved : DecoderParams;
+        // Finding 3: on resume there is nothing to restore from state_buf
+        // because page boundaries always rebuild bit reader and Huffman
+        // tables from input_buf on entry. The resume path now only reads
+        // startPage from metaBuf (perStreamBase + 2u), which the host
+        // primed to cur.pageCursor before dispatch.
         var startPage : u32 = 0u;
         if (isResume) {
-            startPage = restoreState(streamIndex, &bsSaved, &dpSaved, laneIx);
-            // Seed literal bookkeeping.
-            if (laneIx == 0u) { atomicStore(&gLiteralsKept, 0u); }
-            /* workgroupBarrier removed: single-subgroup WG */
+            if (laneIx == 0u) {
+                startPage = atomicLoad(\&metaBuf[perStreamBase + 2u]);
+                atomicStore(\&gLiteralsKept, 0u);
+            }
+            startPage = subgroupBroadcastFirst(startPage);
         }
 
         let pageDesc = BROTLIG_WORK_STREAM_HEADER_SIZE + streamRptr
@@ -2157,15 +2116,10 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>,
         }
 
         if (suspended) {
-            // Spill: we have no in-flight bit reader at this boundary (pages
-            // always reset bs at start), so spilling is mostly a no-op beyond
-            // persisting pageCursor. Nevertheless, we set the resume flag.
-            var bsBlank : DecoderState;
-            bsBlank.holdLo = 0u; bsBlank.holdHi = 0u; bsBlank.validBits = 0u;
-            bsBlank.readPointer = 0u; bsBlank.lane = laneIx;
-            var dpBlank : DecoderParams;
-            dpBlank.npostfix = 0u; dpBlank.n_direct = 0u; dpBlank.isDeltaEncoded = 0u;
-            spillState(streamIndex, bsBlank, currentPage, dpBlank, laneIx);
+            // Finding 3: spillState is a no-op. pageCursor was already
+            // persisted back into metaBuf above; we only need to set the
+            // resume flag bit so the next dispatch takes the isResume path.
+            spillState_noop(streamIndex, currentPage, laneIx);
             if (laneIx == 0u) {
                 atomicOr(\&metaBuf[2], resumeBit);
             }

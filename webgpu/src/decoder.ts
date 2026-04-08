@@ -28,16 +28,16 @@ export interface BrotligDecoderOptions {
 // a tighter upper bound; 2560 is an over-dispatch that wastes groups.
 const REFERENCE_DISPATCH_GROUPS = 2560;
 
-// Per the WGSL port, the persistent state buffer is laid out as one 16 KB
-// slot per active stream.
-const STATE_STRIDE_BYTES = 16 * 1024;
+// Finding 3: the legacy 16 KB-per-stream state buffer has been removed.
+// All cross-dispatch state lives in metaBuf now.
 
 // meta layout (u32 words):
 //   [0] remaining stream count
 //   [1] pageLimit
 //   [2] resume flag bitmask
 //   [3] reserved
-//   [4 + (s-1)*4 .. +3] per-stream: rptr, wptr, pageCursor, savedStateOffset
+//   [4 + (s-1)*4 .. +3] per-stream: rptr, wptr, pageCursor, reserved
+//     (slot [+3] was previously savedStateOffset; now unused.)
 const META_HEADER_WORDS = 4;
 const META_PER_STREAM_WORDS = 4;
 const META_BYTES_FOR_STREAMS = (n: number) =>
@@ -79,18 +79,42 @@ function getPipelineCache(device: GPUDevice): Promise<PipelineCacheEntry> {
       throw new Error(`BROTLIG_WGSL compile errors:\n${errs}`);
     }
     await assertSubgroupSize32(device, shaderModule, "main");
+    // Finding 4: request subgroup size 32 explicitly. The WGSL types
+    // package shipped with this project does not yet declare
+    // `requiredSubgroupSize`, so we cast. If the browser rejects the
+    // option (e.g. older implementations), fall back to creating the
+    // pipeline without the field.
+    type ComputeStageWithSubgroup = GPUProgrammableStage & {
+      requiredSubgroupSize?: number;
+    };
+    const computeStage: ComputeStageWithSubgroup = {
+      module: shaderModule,
+      entryPoint: "main",
+      requiredSubgroupSize: 32,
+    };
     const bindGroupLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
         { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
-        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        // Finding 3: state_buf binding removed.
       ],
     });
-    const pipeline = device.createComputePipeline({
-      layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
-      compute: { module: shaderModule, entryPoint: "main" },
-    });
+    let pipeline: GPUComputePipeline;
+    try {
+      pipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+        compute: computeStage as GPUProgrammableStage,
+      });
+    } catch (err) {
+      // Fallback: older implementations may reject requiredSubgroupSize.
+      const { requiredSubgroupSize: _drop, ...fallback } = computeStage;
+      void _drop;
+      pipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+        compute: fallback,
+      });
+    }
     return { pipeline, bindGroupLayout };
   })();
   pipelineCache.set(device, p);
@@ -109,8 +133,6 @@ interface InFlightStream {
   // Absolute byte offset into the GPU input buffer where this stream's
   // compressed bytes start.
   inputBase: number;
-  // Slot in the state buffer (0..maxActiveStreams-1).
-  stateSlot: number;
   // Number of pages already decoded by prior dispatches.
   pageCursor: number;
   // Bytes produced by prior dispatches (running wptr, relative to outputBase).
@@ -133,8 +155,6 @@ export class BrotligStreamDecoder {
   private metaBuf: GPUBuffer;
   private outputBuf: GPUBuffer;
   private outputCap: number;
-  private stateBuf: GPUBuffer;
-  private stateCap: number;
   private readbackBuf: GPUBuffer;
   private cachedBindGroup: GPUBindGroup | null = null;
 
@@ -161,8 +181,6 @@ export class BrotligStreamDecoder {
     metaBuf: GPUBuffer,
     outputBuf: GPUBuffer,
     outputCap: number,
-    stateBuf: GPUBuffer,
-    stateCap: number,
     readbackBuf: GPUBuffer,
     maxActiveStreams: number,
   ) {
@@ -174,8 +192,6 @@ export class BrotligStreamDecoder {
     this.metaBuf = metaBuf;
     this.outputBuf = outputBuf;
     this.outputCap = outputCap;
-    this.stateBuf = stateBuf;
-    this.stateCap = stateCap;
     this.readbackBuf = readbackBuf;
     this.maxActiveStreams = maxActiveStreams;
   }
@@ -192,7 +208,6 @@ export class BrotligStreamDecoder {
 
     const inputCap = nextPow2(Math.max(maxInput, 1024));
     const outputCap = nextPow2(Math.max(maxOutput, 1024));
-    const stateCap = nextPow2(Math.max(maxStreams * STATE_STRIDE_BYTES, 1024));
 
     const inputBuf = device.createBuffer({
       size: inputCap,
@@ -207,10 +222,6 @@ export class BrotligStreamDecoder {
       size: outputCap,
       usage:
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
-    const stateBuf = device.createBuffer({
-      size: stateCap,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
     const readbackBuf = device.createBuffer({
       size: outputCap,
@@ -229,8 +240,6 @@ export class BrotligStreamDecoder {
       metaBuf,
       outputBuf,
       outputCap,
-      stateBuf,
-      stateCap,
       readbackBuf,
       maxStreams,
     );
@@ -239,7 +248,7 @@ export class BrotligStreamDecoder {
   // Grow one of the persistent buffers, preserving existing content via a
   // GPU-side copy. For output, the readback buffer must grow in lockstep.
   private growBuffer(
-    kind: "input" | "output" | "state",
+    kind: "input" | "output",
     required: number,
   ): void {
     const newCap = nextPow2(required);
@@ -258,7 +267,7 @@ export class BrotligStreamDecoder {
       this.inputBuf.destroy();
       this.inputBuf = next;
       this.inputCap = newCap;
-    } else if (kind === "output") {
+    } else {
       const next = this.device.createBuffer({
         size: newCap,
         usage:
@@ -277,20 +286,6 @@ export class BrotligStreamDecoder {
         size: newCap,
         usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
       });
-    } else {
-      // state: per-stream content persists across dispatches within a
-      // stream's lifetime, so preserve it.
-      const next = this.device.createBuffer({
-        size: newCap,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
-      });
-      if (this.stateCap > 0) {
-        encoder.copyBufferToBuffer(this.stateBuf, 0, next, 0, this.stateCap);
-      }
-      this.device.queue.submit([encoder.finish()]);
-      this.stateBuf.destroy();
-      this.stateBuf = next;
-      this.stateCap = newCap;
     }
   }
 
@@ -365,16 +360,10 @@ export class BrotligStreamDecoder {
     if (outputEnd > this.outputCap) this.growBuffer("output", outputEnd);
     this.outputWritten = outputEnd;
 
-    const stateSlot = 0;
-    if ((stateSlot + 1) * STATE_STRIDE_BYTES > this.stateCap) {
-      this.growBuffer("state", (stateSlot + 1) * STATE_STRIDE_BYTES);
-    }
-
     this.inFlight = {
       stream: parsed,
       inputBase,
       outputBase,
-      stateSlot,
       pageCursor: 0,
       producedBytes: 0,
       headerUploaded: true,
@@ -492,7 +481,7 @@ export class BrotligStreamDecoder {
     // page_index, which the host restores via meta[6] (pageCursor).
     meta[5] = cur.outputBase; // wptr
     meta[6] = cur.pageCursor; // pageCursor
-    meta[7] = cur.stateSlot * STATE_STRIDE_BYTES; // savedStateOffset
+    meta[7] = 0; // reserved (was savedStateOffset; Finding 3)
     this.device.queue.writeBuffer(this.metaBuf, 0, meta.buffer, 0, META_BYTES_FOR_STREAMS(1));
 
     const encoder = this.device.createCommandEncoder();
@@ -508,7 +497,6 @@ export class BrotligStreamDecoder {
           { binding: 0, resource: { buffer: this.inputBuf } },
           { binding: 1, resource: { buffer: this.metaBuf } },
           { binding: 2, resource: { buffer: this.outputBuf } },
-          { binding: 3, resource: { buffer: this.stateBuf } },
         ],
       });
     }
@@ -590,7 +578,6 @@ export class BrotligStreamDecoder {
     this.inputBuf.destroy();
     this.metaBuf.destroy();
     this.outputBuf.destroy();
-    this.stateBuf.destroy();
     this.readbackBuf.destroy();
   }
 }

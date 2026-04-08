@@ -73,24 +73,17 @@ export function requestBrotligDevice(): Promise<GPUDevice> {
 }
 
 // Asserts the compute pipeline will run with subgroup size == 32.
-//
-// TODO: The WebGPU subgroup-size query surface is still in flux. Chrome
-// exposes `GPUAdapterInfo.subgroupMinSize`/`subgroupMaxSize` behind the
-// subgroups feature, and pipelines can be created with
-// `requiredSubgroupSize`. Once the final API ships we should:
-//   1. Prefer creating the pipeline with `requiredSubgroupSize: 32`
-//      inside `compute: { ..., requiredSubgroupSize: 32 }`.
-//   2. Fall back to reading `adapter.info.subgroupMinSize` /
-//      `subgroupMaxSize` and refusing if 32 is out of range.
-// For now we do a best-effort check against adapter info and otherwise
-// accept and warn.
+// Finding 4: this is now load-bearing. The caller also requests
+// `requiredSubgroupSize: 32` on the compute pipeline; this function
+// additionally probes GPUAdapterInfo.subgroupMinSize/subgroupMaxSize where
+// available and throws if 32 is outside the adapter's supported range.
+// If neither field is queryable we trust the pipeline-side
+// requiredSubgroupSize request and return.
 export async function assertSubgroupSize32(
   device: GPUDevice,
   shaderModule: GPUShaderModule,
   entryPoint: string,
 ): Promise<void> {
-  // Touch the arguments so the scaffold compiles cleanly even though the
-  // real probing logic is not wired yet.
   void shaderModule;
   void entryPoint;
 
@@ -100,16 +93,14 @@ export async function assertSubgroupSize32(
 
   const min = info?.subgroupMinSize;
   const max = info?.subgroupMaxSize;
-  if (typeof min === "number" && typeof max === "number") {
-    if (min > 32 || max < 32) {
-      throw new Error(
-        `Brotli-G decoder requires subgroup size 32, adapter reports [${min}, ${max}]`,
-      );
-    }
-    return;
+  if (typeof min === "number" && min > 32) {
+    throw new Error(
+      `Brotli-G decoder requires subgroup size 32, adapter reports subgroupMinSize=${min}`,
+    );
   }
-
-  // TODO: once requiredSubgroupSize is standardized, create a throwaway
-  // pipeline here with requiredSubgroupSize:32 and rely on WebGPU to
-  // reject mismatched adapters.
+  if (typeof max === "number" && max < 32) {
+    throw new Error(
+      `Brotli-G decoder requires subgroup size 32, adapter reports subgroupMaxSize=${max}`,
+    );
+  }
 }

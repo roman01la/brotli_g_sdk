@@ -45,8 +45,8 @@ async function main() {
     window.__BROTLIG_RESULT__ = { status: "import-fail", error: String(e) };
     return;
   }
-  const { decode, BrotligStreamDecoder, requestBrotligDevice } = mod;
-  log("module loaded: decode, BrotligStreamDecoder, requestBrotligDevice", "info");
+  const { decode, BrotligStreamDecoder, requestBrotligDevice, parseStreamHeaderOnly } = mod;
+  log("module loaded: decode, BrotligStreamDecoder, requestBrotligDevice, parseStreamHeaderOnly", "info");
 
   try {
     const dev = await requestBrotligDevice();
@@ -68,6 +68,10 @@ async function main() {
     ["bc3",    "test/fixtures/bc3.brotlig",    "test/fixtures/bc3.raw.golden"],
     ["bc4",    "test/fixtures/bc4.brotlig",    "test/fixtures/bc4.raw.golden"],
     ["bc5",    "test/fixtures/bc5.brotlig",    "test/fixtures/bc5.raw.golden"],
+    // Finding 5B: pathological synthetic inputs.
+    ["allzero","test/fixtures/allzero.brotlig","test/fixtures/allzero.bin.golden"],
+    ["allone", "test/fixtures/allone.brotlig", "test/fixtures/allone.bin.golden"],
+    ["repeat", "test/fixtures/repeat.brotlig", "test/fixtures/repeat.bin.golden"],
   ];
 
   function bufEq(a, b) {
@@ -137,6 +141,9 @@ async function main() {
     ["medium", 1024],
     ["bc3",    64],
     ["bc5",    64],
+    ["allzero", 16],
+    ["allone",  16],
+    ["repeat",  16],
   ];
   for (const [name, chunk] of streamingCases) {
     const fx = fixtures.find((f) => f[0] === name);
@@ -158,6 +165,128 @@ async function main() {
       fail++; results.push({ name: `stream ${name} chunk=${chunk}`, ok: false, reason: String(e) });
     }
   }
+
+  // Finding 5C: jagged (deterministically randomized) chunk sizes on medium.
+  // Uses a small xorshift32 PRNG so the sequence is reproducible.
+  function* jaggedChunks(total, seed) {
+    let s = seed >>> 0;
+    let i = 0;
+    while (i < total) {
+      s ^= s << 13; s >>>= 0;
+      s ^= s >>> 17; s >>>= 0;
+      s ^= s << 5;  s >>>= 0;
+      // Bias toward small sizes but occasionally larger bursts.
+      const pool = [1, 2, 3, 7, 17, 64, 256, 1024, 8192];
+      const sz = pool[s % pool.length];
+      const take = Math.min(sz, total - i);
+      yield take;
+      i += take;
+    }
+  }
+  async function decodeJagged(input, seed) {
+    const dec = await BrotligStreamDecoder.create();
+    const parts = [];
+    let off = 0;
+    for (const take of jaggedChunks(input.length, seed)) {
+      const out = await dec.push(input.subarray(off, off + take));
+      if (out.length) parts.push(out);
+      off += take;
+    }
+    const tail = await dec.end();
+    if (tail.length) parts.push(tail);
+    dec.destroy();
+    let total = 0; for (const p of parts) total += p.length;
+    const joined = new Uint8Array(total);
+    let p2 = 0; for (const p of parts) { joined.set(p, p2); p2 += p.length; }
+    return joined;
+  }
+  {
+    const name = "medium";
+    const fx = fixtures.find((f) => f[0] === name);
+    const t0 = performance.now();
+    try {
+      const [inp, exp] = await Promise.all([fetchBytes(fx[1]), fetchBytes(fx[2])]);
+      const out = await decodeJagged(inp, 0xC0FFEE);
+      const r = bufEq(out, exp);
+      if (r.ok) {
+        log(`  PASS  stream ${name} jagged seed=0xC0FFEE  ${out.length}B in ${(performance.now()-t0).toFixed(0)}ms`, "pass");
+        pass++; results.push({ name: `stream ${name} jagged`, ok: true });
+      } else {
+        log(`  FAIL  stream ${name} jagged: ${r.reason}`, "fail");
+        fail++; results.push({ name: `stream ${name} jagged`, ok: false, reason: r.reason });
+      }
+    } catch (e) {
+      log(`  FAIL  stream ${name} jagged: ${e.message}`, "fail");
+      fail++; results.push({ name: `stream ${name} jagged`, ok: false, reason: String(e) });
+    }
+  }
+
+  // Finding 5A: multi-stream. Concatenate two fixtures and feed them as
+  // a single buffer. The shader's stream loop iterates via meta[0], and
+  // push()/end() retire streams as they complete. Verify the output is
+  // the concatenation of both streams' uncompressed data.
+  {
+    try {
+      const [a, b, ag, bg] = await Promise.all([
+        fetchBytes("test/fixtures/tiny.brotlig"),
+        fetchBytes("test/fixtures/small.brotlig"),
+        fetchBytes("test/fixtures/tiny.bin.golden"),
+        fetchBytes("test/fixtures/small.txt.golden"),
+      ]);
+      const combined = new Uint8Array(a.length + b.length);
+      combined.set(a, 0); combined.set(b, a.length);
+      const expected = new Uint8Array(ag.length + bg.length);
+      expected.set(ag, 0); expected.set(bg, ag.length);
+      const dec = await BrotligStreamDecoder.create();
+      const parts = [];
+      const o1 = await dec.push(combined);
+      if (o1.length) parts.push(o1);
+      const o2 = await dec.end();
+      if (o2.length) parts.push(o2);
+      dec.destroy();
+      let total = 0; for (const p of parts) total += p.length;
+      const out = new Uint8Array(total);
+      let p2 = 0; for (const p of parts) { out.set(p, p2); p2 += p.length; }
+      const r = bufEq(out, expected);
+      if (r.ok) {
+        log(`  PASS  multi-stream tiny+small  ${out.length}B`, "pass");
+        pass++; results.push({ name: "multi-stream tiny+small", ok: true });
+      } else {
+        log(`  FAIL  multi-stream tiny+small: ${r.reason}`, "fail");
+        fail++; results.push({ name: "multi-stream tiny+small", ok: false, reason: r.reason });
+      }
+    } catch (e) {
+      log(`  FAIL  multi-stream tiny+small: ${e.message}`, "fail");
+      fail++; results.push({ name: "multi-stream tiny+small", ok: false, reason: String(e) });
+    }
+  }
+
+  // Finding 5D: malformed-header rejection. Corrupt the magic byte of a
+  // known-good stream header and assert parseStreamHeaderOnly returns null.
+  {
+    try {
+      const src = await fetchBytes("test/fixtures/tiny.brotlig");
+      const bad = new Uint8Array(src);
+      bad[0] = (bad[0] ^ 0xff) & 0xff;
+      const parsed = parseStreamHeaderOnly(bad, 0);
+      if (parsed === null || parsed === undefined) {
+        log("  PASS  malformed header rejected", "pass");
+        pass++; results.push({ name: "malformed header rejected", ok: true });
+      } else {
+        log("  FAIL  malformed header NOT rejected (got a parsed header)", "fail");
+        fail++; results.push({ name: "malformed header rejected", ok: false, reason: "parseStreamHeaderOnly returned a value for a corrupted magic byte" });
+      }
+    } catch (e) {
+      log(`  FAIL  malformed header rejected: ${e.message}`, "fail");
+      fail++; results.push({ name: "malformed header rejected", ok: false, reason: String(e) });
+    }
+  }
+
+  // Finding 5E note: back-reference-past-outlimit regression covering
+  // Finding 1 is not directly exercised here. Constructing a stream whose
+  // encoder emits a copy_len that extends past page-end cannot be done
+  // with the existing CPU CLI. The fix is trusted based on HLSL parity
+  // with BrotliGCompute.hlsl:1399.
 
   const summary = `${pass} passed, ${fail} failed (${pass + fail} total)`;
   log("\n" + summary, fail ? "fail" : "pass");
