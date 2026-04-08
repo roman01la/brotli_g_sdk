@@ -10,10 +10,8 @@ import { requestBrotligDevice, assertSubgroupSize32 } from "./device.js";
 import { BROTLIG_WGSL } from "./shader.js";
 import {
   findCompleteStreams,
-  parseStream,
-  BROTLIG_STREAM_HEADER_SIZE,
-  BROTLIG_PRECON_HEADER_SIZE,
-  type ParsedStream,
+  parseStreamHeaderOnly,
+  type ParsedStreamHeader,
 } from "./format.js";
 
 export interface BrotligDecoderOptions {
@@ -104,7 +102,7 @@ function getPipelineCache(device: GPUDevice): Promise<PipelineCacheEntry> {
 // workgroup-per-stream model this list has at most one entry, but the
 // structure is in place for future pipelining.
 interface InFlightStream {
-  stream: ParsedStream;
+  stream: ParsedStreamHeader;
   // Absolute byte offset into the GPU output buffer where this stream's
   // uncompressed bytes start.
   outputBase: number;
@@ -115,8 +113,14 @@ interface InFlightStream {
   stateSlot: number;
   // Number of pages already decoded by prior dispatches.
   pageCursor: number;
-  // Bytes produced by prior dispatches (running wptr).
+  // Bytes produced by prior dispatches (running wptr, relative to outputBase).
   producedBytes: number;
+  // True once header + precon + page table have been uploaded to inputBase.
+  headerUploaded: boolean;
+  // How many pages' compressed body bytes have been uploaded so far.
+  pagesUploaded: number;
+  // Absolute input-buffer offset where the next page body bytes go.
+  inputBodyWritten: number;
 }
 
 export class BrotligStreamDecoder {
@@ -301,95 +305,87 @@ export class BrotligStreamDecoder {
     this.ringLen += chunk.length;
   }
 
-  // Parse a stream header + (possibly partial) page table to determine how
-  // many pages are fully resident in `buf` starting at `offset`. Returns
-  // null if the header/page-table is not yet fully present.
-  //
-  // Uses the format.ts quirk: pageOffsets[0] is the compressed size of the
-  // LAST page; pageOffsets[i>0] is the start offset of page i relative to
-  // dataOffset. Therefore the end of page i (for i < numPages-1) is
-  // pageOffsets[i+1], and the end of the last page is
-  // pageOffsets[numPages-1] + pageOffsets[0].
-  private residentPageCount(
-    buf: Uint8Array,
-    offset: number,
-  ): { resident: number; parsed: ParsedStream } | null {
-    // parseStream returns null while header/precon/page-table are partial,
-    // but it also returns null if the *body* is partial. We want the latter
-    // case to still succeed for partial-body streams, so we inline a
-    // lighter-weight residency check using the same layout rules.
-    if (buf.length - offset < BROTLIG_STREAM_HEADER_SIZE) return null;
-    const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-    const id = view.getUint8(offset + 0);
-    const magic = view.getUint8(offset + 1);
-    if ((id ^ 0xff) !== magic) return null;
-    const numPages = view.getUint16(offset + 2, true);
-    const word = view.getUint32(offset + 4, true);
-    const isPrecon = ((word >>> 20) & 1) === 1;
-    let cursor = offset + BROTLIG_STREAM_HEADER_SIZE;
-    if (isPrecon) cursor += BROTLIG_PRECON_HEADER_SIZE;
-    const tableBytes = numPages * 4;
-    if (buf.length - cursor < tableBytes) return null;
+  // Compressed byte range (relative to dataOffset) for page `p`. Uses the
+  // format.ts quirk: pageOffsets[0] holds the LAST page's compressed size;
+  // pageOffsets[i>0] is the start offset of page i relative to dataOffset.
+  private pageStart(stream: ParsedStreamHeader, p: number): number {
+    return p === 0 ? 0 : stream.pageOffsets[p];
+  }
+  private pageEnd(stream: ParsedStreamHeader, p: number): number {
+    const numPages = stream.header.numPages;
+    if (p < numPages - 1) return stream.pageOffsets[p + 1];
+    // last page: start + size (size stored in pageOffsets[0])
+    const lastStart = numPages > 1 ? stream.pageOffsets[numPages - 1] : 0;
+    return lastStart + stream.pageOffsets[0];
+  }
 
-    // We have enough to read the page table; synthesize a ParsedStream via
-    // parseStream with a virtual buffer that is "complete enough". Because
-    // parseStream requires the full body, we temporarily relax by building
-    // the ParsedStream manually from what we just read, but only when the
-    // full stream is resident. Otherwise we return a minimal descriptor.
-    const pageOffsets = new Uint32Array(numPages);
-    for (let i = 0; i < numPages; i++) {
-      pageOffsets[i] = view.getUint32(cursor + i * 4, true);
+  // Upload aligned to 4 bytes (writeBuffer requirement). Padding bytes
+  // beyond the actual body are harmless as the shader only reads up to
+  // each page's compressed size.
+  private writeAligned(dstOffset: number, slice: Uint8Array): void {
+    const padded = slice.byteLength % 4 === 0
+      ? slice
+      : (() => {
+          const p = new Uint8Array(Math.ceil(slice.byteLength / 4) * 4);
+          p.set(slice);
+          return p;
+        })();
+    this.device.queue.writeBuffer(
+      this.inputBuf,
+      dstOffset,
+      padded.buffer,
+      padded.byteOffset,
+      padded.byteLength,
+    );
+  }
+
+  // Start a new in-flight stream as soon as the header + precon + page table
+  // are resident in the ring. Uploads only the header bytes; page bodies are
+  // uploaded lazily as they become resident. Returns false if the ring does
+  // not yet contain enough bytes to parse the header.
+  private tryStartStream(): boolean {
+    if (this.ringLen === 0) return false;
+    const view = this.ring.subarray(0, this.ringLen);
+    const parsed = parseStreamHeaderOnly(view, 0);
+    if (!parsed) return false;
+
+    const headerBytes = parsed.totalHeaderBytes;
+    const inputBase = this.inputWritten;
+    // Reserve capacity for the header now; body will extend inputWritten
+    // as pages are uploaded.
+    if (inputBase + headerBytes > this.inputCap) {
+      this.growBuffer("input", inputBase + headerBytes);
     }
-    const dataOffset = cursor + tableBytes;
-    const lastSize = numPages > 0 ? pageOffsets[0] : 0;
-    const lastStart = numPages > 1 ? pageOffsets[numPages - 1] : 0;
-    const pageDataBytes = lastStart + lastSize;
-    const totalBytes = dataOffset - offset + pageDataBytes;
+    this.writeAligned(inputBase, view.subarray(0, headerBytes));
+    this.inputWritten = inputBase + headerBytes;
 
-    // Count pages fully resident. Page i end offset (relative to dataOffset)
-    // is pageOffsets[i+1] for i < numPages-1, else lastStart+lastSize.
-    let resident = 0;
-    for (let i = 0; i < numPages; i++) {
-      const endRel =
-        i < numPages - 1 ? pageOffsets[i + 1] : lastStart + lastSize;
-      if (buf.length - dataOffset >= endRel) resident++;
-      else break;
+    // Reserve an output region of uncompressedSize.
+    const outputBase = this.outputWritten;
+    const outputEnd = outputBase + parsed.header.uncompressedSize;
+    if (outputEnd > this.outputCap) this.growBuffer("output", outputEnd);
+    this.outputWritten = outputEnd;
+
+    const stateSlot = 0;
+    if ((stateSlot + 1) * STATE_STRIDE_BYTES > this.stateCap) {
+      this.growBuffer("state", (stateSlot + 1) * STATE_STRIDE_BYTES);
     }
 
-    // If the whole stream is resident, prefer parseStream's canonical
-    // ParsedStream (includes precondition).
-    const fullyResident = resident === numPages;
-    if (fullyResident) {
-      const parsed = parseStream(buf, offset);
-      if (!parsed) return null;
-      return { resident, parsed };
-    }
-
-    // Construct a partial ParsedStream manually. We reuse the header but
-    // mark totalBytes as what WOULD be present if fully resident. Callers
-    // must not rely on buf containing all of [offset, offset+totalBytes).
-    const pageSizeIdx = word & 0x3;
-    const lastPageSize = (word >>> 2) & 0x3ffff;
-    const pageSize = (32 * 1024) << pageSizeIdx;
-    const uncompressedSize =
-      numPages * pageSize - (lastPageSize === 0 ? 0 : pageSize - lastPageSize);
-    const parsed: ParsedStream = {
-      header: {
-        id,
-        numPages,
-        pageSizeIdx,
-        pageSize,
-        lastPageSize,
-        isPreconditioned: isPrecon,
-        uncompressedSize,
-      },
-      precondition: null,
-      pageOffsets,
-      dataOffset,
-      streamOffset: offset,
-      totalBytes,
+    this.inFlight = {
+      stream: parsed,
+      inputBase,
+      outputBase,
+      stateSlot,
+      pageCursor: 0,
+      producedBytes: 0,
+      headerUploaded: true,
+      pagesUploaded: 0,
+      inputBodyWritten: inputBase + headerBytes,
     };
-    return { resident, parsed };
+
+    // Drop the consumed header bytes from the ring.
+    this.ring.copyWithin(0, headerBytes, this.ringLen);
+    this.ringLen -= headerBytes;
+    return true;
   }
 
   async push(chunk: Uint8Array): Promise<Uint8Array> {
@@ -406,105 +402,73 @@ export class BrotligStreamDecoder {
 
     const produced: Uint8Array[] = [];
 
-    // Loop: peel off streams as they make forward progress. Each iteration
-    // makes at least one dispatch against the currently-pending stream (or
-    // selects a new one if none is in-flight), and breaks when no stream
-    // can make progress with the bytes currently buffered.
+    // Incremental-upload / page-level-streaming loop:
+    //   1. Start a stream as soon as its header+precon+page table arrive.
+    //   2. Upload only the page bodies that are currently resident in the
+    //      ring, advancing pagesUploaded.
+    //   3. Dispatch with pageLimit = pagesUploaded. The shader breaks its
+    //      inner page loop at pageLimit and spills state so the next
+    //      dispatch resumes. Readback pulls only the newly produced bytes.
+    //   4. Retire the stream when pageCursor >= numPages.
     // eslint-disable-next-line no-constant-condition
     while (true) {
-      // If no stream is in flight, try to start one from the ring head.
       if (!this.inFlight) {
-        if (this.ringLen === 0) break;
-        const view = this.ring.subarray(0, this.ringLen);
-        const probe = this.residentPageCount(view, 0);
-        if (!probe) break; // need more header bytes
-        const { parsed } = probe;
+        if (!this.tryStartStream()) break;
+      }
+      const cur = this.inFlight!;
+      const stream = cur.stream;
+      const numPages = stream.header.numPages;
 
-        // Upload compressed bytes. For now we only start a stream when the
-        // full stream is resident, because uploading a partial body would
-        // require tracking how many bytes we've pushed into the GPU input
-        // buffer for this stream across pushes. That enhancement is left
-        // as a TODO; see residentPageCount() comment.
-        // TODO: true incremental upload of compressed bytes as they arrive,
-        // to unlock pageLimit < numPages on the very first dispatch.
-        if (this.ringLen < parsed.totalBytes) break;
+      // Compute how many additional pages are fully resident in the ring.
+      // pageStart(pagesUploaded) is the byte offset (relative to dataOffset)
+      // from which the ring contents begin; an additional page p is resident
+      // iff pageEnd(p) - pageStart(pagesUploaded) <= ringLen.
+      const baseRel = this.pageStart(stream, cur.pagesUploaded);
+      let newResidentPages = 0;
+      while (cur.pagesUploaded + newResidentPages < numPages) {
+        const p = cur.pagesUploaded + newResidentPages;
+        const need = this.pageEnd(stream, p) - baseRel;
+        if (need > this.ringLen) break;
+        newResidentPages++;
+      }
 
-        // Ensure input buffer capacity, then upload [streamOffset, totalBytes).
-        const inputBase = this.inputWritten;
-        const inputEnd = inputBase + parsed.totalBytes;
-        if (inputEnd > this.inputCap) this.growBuffer("input", inputEnd);
-        const slice = view.subarray(0, parsed.totalBytes);
-        // writeBuffer needs an aligned-size copy; pad if necessary.
-        const padded = slice.byteLength % 4 === 0
-          ? slice
-          : (() => {
-              const p = new Uint8Array(Math.ceil(slice.byteLength / 4) * 4);
-              p.set(slice);
-              return p;
-            })();
-        this.device.queue.writeBuffer(
-          this.inputBuf,
-          inputBase,
-          padded.buffer,
-          padded.byteOffset,
-          padded.byteLength,
-        );
-        this.inputWritten = inputEnd;
-
-        // Reserve an output region of uncompressedSize.
-        const outputBase = this.outputWritten;
-        const outputEnd = outputBase + parsed.header.uncompressedSize;
-        if (outputEnd > this.outputCap) this.growBuffer("output", outputEnd);
-        this.outputWritten = outputEnd;
-
-        // Reserve a state slot. We currently only support one in-flight
-        // stream at a time, so slot 0 is always used.
-        // TODO: pool state slots to allow maxActiveStreams concurrent
-        // streams and multi-stream dispatches.
-        const stateSlot = 0;
-        if ((stateSlot + 1) * STATE_STRIDE_BYTES > this.stateCap) {
-          this.growBuffer("state", (stateSlot + 1) * STATE_STRIDE_BYTES);
+      if (newResidentPages > 0) {
+        const firstNew = cur.pagesUploaded;
+        const lastNew = firstNew + newResidentPages - 1;
+        const uploadBytes =
+          this.pageEnd(stream, lastNew) - this.pageStart(stream, firstNew);
+        const dstOff = cur.inputBodyWritten;
+        if (dstOff + uploadBytes > this.inputCap) {
+          this.growBuffer("input", dstOff + uploadBytes);
         }
+        this.writeAligned(dstOff, this.ring.subarray(0, uploadBytes));
+        cur.inputBodyWritten = dstOff + uploadBytes;
+        this.inputWritten = Math.max(this.inputWritten, cur.inputBodyWritten);
+        cur.pagesUploaded += newResidentPages;
 
-        this.inFlight = {
-          stream: parsed,
-          inputBase,
-          outputBase,
-          stateSlot,
-          pageCursor: 0,
-          producedBytes: 0,
-        };
-
-        // Drop the consumed ring bytes now that they're uploaded.
-        this.ring.copyWithin(0, parsed.totalBytes, this.ringLen);
-        this.ringLen -= parsed.totalBytes;
+        // Drop the consumed body bytes from the ring.
+        this.ring.copyWithin(0, uploadBytes, this.ringLen);
+        this.ringLen -= uploadBytes;
       }
 
-      const cur = this.inFlight;
-      // Determine pageLimit. Because we currently require the whole stream
-      // to be resident before uploading (see above), pageLimit is always
-      // numPages. The partial-residency code path in residentPageCount()
-      // is in place so that when incremental upload is implemented this
-      // becomes `residentPages` instead.
-      // TODO: once incremental upload works, recompute residentPages per
-      // push() and set pageLimit to the number of *newly* resident pages.
-      const pageLimit = cur.stream.header.numPages;
-      if (cur.pageCursor >= pageLimit) {
-        // Already done; fall through to readback.
-      } else {
-        const newBytes = await this.dispatch(cur, pageLimit);
-        if (newBytes.length > 0) produced.push(newBytes);
-      }
+      // If no pages are available to dispatch beyond what has been decoded,
+      // we cannot make progress with the current buffer state.
+      if (cur.pagesUploaded <= cur.pageCursor) break;
 
-      // If the stream is now fully decoded, retire it and loop to try the
-      // next one.
-      if (cur.pageCursor >= cur.stream.header.numPages) {
+      const pageLimit = cur.pagesUploaded;
+      if (process.env.BROTLIG_DEBUG) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `[brotlig] dispatch pageLimit=${pageLimit} pagesUploaded=${cur.pagesUploaded} numPages=${numPages} pageCursor=${cur.pageCursor}`,
+        );
+      }
+      const newBytes = await this.dispatch(cur, pageLimit);
+      if (newBytes.length > 0) produced.push(newBytes);
+
+      if (cur.pageCursor >= numPages) {
         this.inFlight = null;
         continue;
       }
-      // Stream still pending but we made no forward progress possible
-      // (e.g. waiting on more input). Break.
-      break;
     }
 
     return concat(produced);
@@ -552,15 +516,19 @@ export class BrotligStreamDecoder {
     pass.dispatchWorkgroups(REFERENCE_DISPATCH_GROUPS, 1, 1);
     pass.end();
 
-    // Assume the dispatch processes pageLimit - pageCursor pages and
-    // produces the corresponding uncompressed bytes. Because we currently
-    // only run a single whole-stream dispatch per stream, the new byte
-    // range is [producedBytes, uncompressedSize).
-    // TODO: to support partial dispatches we must read back meta[5] (wptr)
-    // here to learn how many bytes the shader actually wrote. That adds
-    // a map-round-trip per dispatch; defer until multi-dispatch streams
-    // are exercised.
-    const newEnd = cur.stream.header.uncompressedSize;
+    // The shader writes each page at streamWptr + page_index * pageSize.
+    // After a dispatch with pageLimit == pagesUploaded, the shader has
+    // populated pages [pageCursor, pageLimit). We do not read meta[5]
+    // back: the shader does not update the wptr slot during decode (wptr
+    // is a function-local inside CSMain), so its value remains the
+    // host-supplied streamWptr. Instead, produced bytes are deterministic
+    // from pagesUploaded because page sizes are fixed (pageSize) except
+    // the last page which uses lastPageSize.
+    const header = cur.stream.header;
+    const finishedAll = pageLimit >= header.numPages;
+    const newEnd = finishedAll
+      ? header.uncompressedSize
+      : pageLimit * header.pageSize;
     const newStart = cur.producedBytes;
     const newLen = newEnd - newStart;
 
@@ -590,9 +558,7 @@ export class BrotligStreamDecoder {
       this.readbackBuf.unmap();
     }
 
-    // Advance host-side cursors to reflect what the shader (we assume)
-    // produced. When partial-dispatch support lands, these must be set
-    // from the read-back meta record instead.
+    // Advance host-side cursors to reflect the pages the shader decoded.
     cur.producedBytes = newEnd;
     cur.pageCursor = pageLimit;
 

@@ -82,6 +82,95 @@ function bits(v: number, lo: number, hi: number): number {
   return (v >>> lo) & mask;
 }
 
+/**
+ * Header-only parse result: everything required to know per-page compressed
+ * byte ranges without requiring the page bodies to be resident in `buf`.
+ *
+ * `totalHeaderBytes` is the number of bytes from `offset` through the end of
+ * the page offset table (i.e. `dataOffset - offset`). Callers can safely
+ * upload exactly this many bytes before any page bodies are available.
+ */
+export interface ParsedStreamHeader {
+  header: StreamHeader;
+  precondition: PreconditionHeader | null;
+  pageOffsets: Uint32Array;
+  dataOffset: number;
+  streamOffset: number;
+  totalHeaderBytes: number;
+}
+
+export function parseStreamHeaderOnly(
+  buf: Uint8Array,
+  offset: number,
+): ParsedStreamHeader | null {
+  if (offset < 0 || offset > buf.length) return null;
+  if (buf.length - offset < BROTLIG_STREAM_HEADER_SIZE) return null;
+
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+
+  const id = view.getUint8(offset + 0);
+  const magic = view.getUint8(offset + 1);
+  if ((id ^ 0xff) !== magic) return null;
+  if (id !== BROTLIG_STREAM_ID) return null;
+
+  const numPages = view.getUint16(offset + 2, true);
+  const word = view.getUint32(offset + 4, true);
+  const pageSizeIdx = bits(word, 0, 1);
+  const lastPageSize = bits(word, 2, 19);
+  const isPreconditioned = bits(word, 20, 20) === 1;
+
+  const pageSize = BROTLIG_MIN_PAGE_SIZE << pageSizeIdx;
+  const uncompressedSize =
+    numPages * pageSize - (lastPageSize === 0 ? 0 : pageSize - lastPageSize);
+
+  let cursor = offset + BROTLIG_STREAM_HEADER_SIZE;
+
+  let precondition: PreconditionHeader | null = null;
+  if (isPreconditioned) {
+    if (buf.length - cursor < BROTLIG_PRECON_HEADER_SIZE) return null;
+    const w0 = view.getUint32(cursor + 0, true);
+    const w1 = view.getUint32(cursor + 4, true);
+    precondition = {
+      swizzled: bits(w0, 0, 0) === 1,
+      pitchD3D12Aligned: bits(w0, 1, 1) === 1,
+      widthInBlocks: bits(w0, 2, 16) + 1,
+      heightInBlocks: bits(w0, 17, 31) + 1,
+      format: bits(w1, 0, 7),
+      numMips: bits(w1, 8, 12) + 1,
+      pitchInBytes: bits(w1, 13, 31) + 1,
+    };
+    cursor += BROTLIG_PRECON_HEADER_SIZE;
+  }
+
+  const tableBytes = numPages * 4;
+  if (buf.length - cursor < tableBytes) return null;
+
+  const pageOffsets = new Uint32Array(numPages);
+  for (let i = 0; i < numPages; i++) {
+    pageOffsets[i] = view.getUint32(cursor + i * 4, true);
+  }
+  cursor += tableBytes;
+
+  const header: StreamHeader = {
+    id,
+    numPages,
+    pageSizeIdx,
+    pageSize,
+    lastPageSize,
+    isPreconditioned,
+    uncompressedSize,
+  };
+
+  return {
+    header,
+    precondition,
+    pageOffsets,
+    dataOffset: cursor,
+    streamOffset: offset,
+    totalHeaderBytes: cursor - offset,
+  };
+}
+
 export function parseStream(
   buf: Uint8Array,
   offset: number,
