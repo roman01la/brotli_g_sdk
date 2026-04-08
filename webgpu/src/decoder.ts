@@ -143,6 +143,12 @@ interface InFlightStream {
   pagesUploaded: number;
   // Absolute input-buffer offset where the next page body bytes go.
   inputBodyWritten: number;
+  // Optional caller-provided destination buffer. When set, dispatch()
+  // writes the decoded bytes directly into this buffer at the absolute
+  // offset corresponding to producedBytes, instead of allocating a fresh
+  // Uint8Array per dispatch. push()/end() then return zero-length views
+  // for these dispatches because the bytes already live in userDest.
+  userDest?: Uint8Array;
 }
 
 export class BrotligStreamDecoder {
@@ -171,6 +177,9 @@ export class BrotligStreamDecoder {
 
   private inFlight: InFlightStream | null = null;
   private destroyed = false;
+  // Caller-provided destination buffer for the next stream that starts.
+  // Set via pushInto() / decodeInto(); cleared once the stream is in flight.
+  private pendingUserDest: Uint8Array | undefined = undefined;
 
   private constructor(
     device: GPUDevice,
@@ -369,7 +378,9 @@ export class BrotligStreamDecoder {
       headerUploaded: true,
       pagesUploaded: 0,
       inputBodyWritten: inputBase + headerBytes,
+      userDest: this.pendingUserDest,
     };
+    this.pendingUserDest = undefined;
 
     // Drop the consumed header bytes from the ring.
     this.ring.copyWithin(0, headerBytes, this.ringLen);
@@ -550,13 +561,14 @@ export class BrotligStreamDecoder {
     if (newLen > 0) {
       const copyLen = Math.ceil(newLen / 4) * 4;
       await this.readbackBuf.mapAsync(GPUMapMode.READ, 0, copyLen);
-      // Single memcpy: allocate the exact-size destination and copy from
-      // the mapped range. Doing `new Uint8Array(src.subarray(0, newLen))`
-      // would memcpy twice (once into the wrapping Uint8Array, once into
-      // the truncated copy). On a 393 MB output that doubled cost is ~40 ms.
-      outBytes = new Uint8Array(newLen);
       const mapped = new Uint8Array(this.readbackBuf.getMappedRange(0, copyLen), 0, newLen);
-      outBytes.set(mapped);
+      if (cur.userDest) {
+        // Write directly into the caller's buffer; skip the allocation.
+        cur.userDest.set(mapped, newStart);
+      } else {
+        outBytes = new Uint8Array(newLen);
+        outBytes.set(mapped);
+      }
       this.readbackBuf.unmap();
     }
 
@@ -602,6 +614,39 @@ function concat(chunks: Uint8Array[]): Uint8Array {
     off += c.length;
   }
   return out;
+}
+
+// Decode directly into a caller-provided destination buffer. Saves a
+// 393-MB-class allocation+memcpy on large outputs by writing the readback
+// bytes straight into `dest` instead of returning a freshly allocated
+// Uint8Array. `dest` must be at least uncompressedSize bytes long; the
+// stream header is parsed from `input` to know the exact required size.
+// Returns the number of bytes written.
+export async function decodeInto(
+  input: Uint8Array,
+  dest: Uint8Array,
+  opts?: BrotligDecoderOptions,
+): Promise<number> {
+  const dec = await BrotligStreamDecoder.create(opts);
+  try {
+    // Set the pending destination so the next stream starts wired to it.
+    (dec as unknown as { pendingUserDest?: Uint8Array }).pendingUserDest = dest;
+    const a = await dec.push(input);
+    const b = await dec.end();
+    if (a.length !== 0 || b.length !== 0) {
+      throw new Error(
+        "decodeInto: decoder unexpectedly returned bytes outside the destination buffer",
+      );
+    }
+    // Recover written length from the in-flight bookkeeping is not
+    // possible after end() retires the stream; instead use the parsed
+    // uncompressed size which we know is exact.
+    const { parseStreamHeaderOnly } = await import("./format.js");
+    const parsed = parseStreamHeaderOnly(input, 0);
+    return parsed?.header.uncompressedSize ?? 0;
+  } finally {
+    dec.destroy();
+  }
 }
 
 // One-shot convenience. Callers who need to decode many streams should
