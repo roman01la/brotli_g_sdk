@@ -99,4 +99,12 @@ Using the sample:
 
 ## WebGPU port
 
-An in-progress WebGPU/WGSL port of the GPU decoder lives under [`webgpu/`](webgpu/). It is a self-contained TypeScript package (`@brotlig/webgpu`) targeting Chrome stable and Node 22+ (via the `webgpu` npm package / Dawn). The WGSL shader is not yet ported from `src/decoder/BrotliGCompute.hlsl`; the package currently ships the host skeleton, streaming decoder API shape, and scaffolding only. See `webgpu/README.md` for details.
+A complete WebGPU/WGSL port of the GPU decoder lives under [`webgpu/`](webgpu/). It is a self-contained TypeScript package (`@brotlig/webgpu`) targeting Chrome stable and Node 22+ (via the `webgpu` npm package / Dawn). The WGSL shader is a full port of `src/decoder/BrotliGCompute.hlsl` (~1900 LOC, 32-thread subgroups) including the BC1..BC5 preconditioned path, and supports both one-shot decode and sub-stream page-level streaming with incremental upload.
+
+Validated byte-for-byte against the CPU reference decoder across the full format matrix (generic data, BC1..BC5 textures, multi-stream containers, pathological inputs) and a real-world 393 MB `emscripten.pack` payload. On Apple Silicon Chrome WebGPU, decoding the 393 MB asset takes ~221 ms (~1.7 GB/s end-to-end via `decodeInto`), roughly **4.6× faster than standard brotli WASM** on the same data.
+
+See [`webgpu/README.md`](webgpu/README.md) for the API, performance numbers, hard requirements (`subgroups` feature, subgroup size 32), test instructions, and known limitations.
+
+## CPU-only CLI
+
+The historical `brotlig_cli` sample target links D3D12 and only builds on Windows. A CPU-only sibling target `brotlig_cpu_cli` (built into `bin/brotlig_cpu`) builds on macOS and Linux and exposes the encoder + CPU decoder via the same command-line surface. It is what `webgpu/test/fixtures/` are generated with. See `sample/CMakeLists.txt`.
