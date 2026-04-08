@@ -8,7 +8,8 @@ lives under `../src/decoder/BrotliGCompute.hlsl`.
 
 Scaffolding only. The WGSL shader is a placeholder; no decoder logic is
 ported yet. The public API shape (`BrotligStreamDecoder`, `decode`) is
-final and will not churn.
+final and will not churn. Preconditioned decode for BC1..BC5 is validated
+end-to-end against CPU round-trip fixtures (`webgpu/scripts/precon-check.ts`).
 
 ## Hard requirements
 

@@ -1391,7 +1391,6 @@ fn ConditionerParams_Init(dc : ptr<function, ConditionerParams>, laneIx : u32) {
         gOffsets_mipblocks[j] = 0u;
         j = j + NUM_LANES;
     }
-    /* workgroupBarrier removed: single-subgroup WG */
 
     // Format table. HLSL:851
     var bsz : u32 = 1u;
@@ -1459,7 +1458,7 @@ fn ConditionerParams_Init(dc : ptr<function, ConditionerParams>, laneIx : u32) {
     (*dc).num_colorsubblocks = ncol;
     gSizes_subblocks[laneIx] = sz;
     gColor_subblocks[laneIx] = col;
-    /* workgroupBarrier removed: single-subgroup WG */
+    // barrier avoided: intra-function cross-lane reads below use subgroupShuffle instead
 
     // HLSL:897 mip dimensions
     let nmips = (*dc).num_mips;
@@ -1492,15 +1491,18 @@ fn ConditionerParams_Init(dc : ptr<function, ConditionerParams>, laneIx : u32) {
 
     gOffsets_mipbytes[laneIx] = 0u;
     gOffsets_mipblocks[laneIx] = 0u;
-    /* workgroupBarrier removed: single-subgroup WG */
+    // barrier avoided: intra-function cross-lane reads below use subgroupShuffle instead
 
     // HLSL:904 mip offsets prefix-sum (serial in HLSL; keep structure).
+    // Use subgroupShuffle to read per-lane mp,mh,mw instead of workgroup memory,
+    // because cross-lane workgroup reads are not reliably visible even within a
+    // single subgroup (BC3 regression).
     var mbytes : u32 = 0u;
     var mblocks : u32 = 0u;
     for (var m : u32 = 0u; m <= nmips; m = m + 1u) {
-        let mp_m = gMip_pitches[m];
-        let mh_m = gMip_heights[m];
-        let mw_m = gMip_widths[m];
+        let mp_m = subgroupShuffle(mp, m);
+        let mh_m = subgroupShuffle(mh, m);
+        let mw_m = subgroupShuffle(mw, m);
         if (m < laneIx) {
             mbytes = mbytes + (mp_m * mh_m);
             mblocks = mblocks + (mw_m * mh_m);
@@ -1508,16 +1510,16 @@ fn ConditionerParams_Init(dc : ptr<function, ConditionerParams>, laneIx : u32) {
     }
     gOffsets_mipbytes[laneIx] = mbytes;
     gOffsets_mipblocks[laneIx] = mblocks;
-    /* workgroupBarrier removed: single-subgroup WG */
 
-    (*dc).num_blocks = gOffsets_mipblocks[nmips];
+    (*dc).num_blocks = subgroupShuffle(mblocks, nmips);
 
-    // HLSL:915 subblock offsets prefix-sum
+    // HLSL:915 subblock offsets prefix-sum. Use subgroupShuffle for cross-lane
+    // read of per-lane sz instead of gSizes_subblocks (see BC3 regression).
     var sboff : u32 = 0u;
     var ssoff : u32 = 0u;
     let nblk = (*dc).num_blocks;
     for (var s : u32 = 0u; s <= nsub; s = s + 1u) {
-        let sbsize = gSizes_subblocks[s];
+        let sbsize = subgroupShuffle(sz, s);
         if (s < laneIx) {
             sboff = sboff + sbsize;
             ssoff = ssoff + sbsize * nblk;
@@ -1525,7 +1527,6 @@ fn ConditionerParams_Init(dc : ptr<function, ConditionerParams>, laneIx : u32) {
     }
     gOffsets_subblocks[laneIx] = sboff;
     gOffsets_substreams[laneIx] = ssoff;
-    /* workgroupBarrier removed: single-subgroup WG */
 }
 
 // HLSL:926 ConditionerParams.GetSub
