@@ -603,26 +603,21 @@ function concat(chunks: Uint8Array[]): Uint8Array {
   return out;
 }
 
-// Cached decoder for the one-shot convenience path. Creating a fresh
-// decoder per call leaks GPU buffers in the Dawn native addon used by
-// the `webgpu` npm package. Reusing a single instance also makes repeat
-// calls ~3x faster in browsers.
-const decoderCache = new WeakMap<GPUDevice, Promise<BrotligStreamDecoder>>();
-
+// One-shot convenience. Callers who need to decode many streams should
+// create a BrotligStreamDecoder explicitly and reuse it via push()/end();
+// decode() creates a fresh decoder per call.
 export async function decode(
   input: Uint8Array,
   opts?: BrotligDecoderOptions,
 ): Promise<Uint8Array> {
-  const device = opts?.device ?? (await requestBrotligDevice());
-  let decP = decoderCache.get(device);
-  if (!decP) {
-    decP = BrotligStreamDecoder.create({ ...opts, device });
-    decoderCache.set(device, decP);
+  const dec = await BrotligStreamDecoder.create(opts);
+  try {
+    const a = await dec.push(input);
+    const b = await dec.end();
+    return concat([a, b]);
+  } finally {
+    dec.destroy();
   }
-  const dec = await decP;
-  const a = await dec.push(input);
-  const b = await dec.end();
-  return concat([a, b]);
 }
 
 // Keep a reference to findCompleteStreams so callers that want whole-buffer
