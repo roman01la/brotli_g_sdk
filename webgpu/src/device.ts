@@ -64,7 +64,18 @@ export function requestBrotligDevice(): Promise<GPUDevice> {
           "by the Brotli-G decoder (port of a 32-thread wavefront HLSL kernel).",
       );
     }
-    return adapter.requestDevice({ requiredFeatures: [SUBGROUPS_FEATURE] });
+    // Request the maximum buffer/storage limits the adapter supports so the
+    // decoder can handle large inputs (e.g. >128 MB compressed payloads).
+    // Default limits are typically 128 MiB for both storage binding and
+    // total buffer size, which is too small for many real assets.
+    const lim = adapter.limits;
+    return adapter.requestDevice({
+      requiredFeatures: [SUBGROUPS_FEATURE],
+      requiredLimits: {
+        maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
+        maxBufferSize: lim.maxBufferSize,
+      },
+    });
   })().catch((e) => {
     cachedDevice = null;
     throw e;
