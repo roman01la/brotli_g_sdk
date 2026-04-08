@@ -1,0 +1,176 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Brotli-G WebGPU decoder browser test</title>
+<style>
+body { font-family: ui-monospace, monospace; background: #111; color: #eee; padding: 20px; }
+.pass { color: #4c4; }
+.fail { color: #f55; }
+.info { color: #88f; }
+pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Brotli-G WebGPU decoder — browser test</h1>
+<pre id="log">starting...
+</pre>
+<div id="summary">running...</div>
+<script type="module">
+const logEl = document.getElementById("log");
+const summaryEl = document.getElementById("summary");
+function log(msg, cls) {
+  const span = document.createElement("span");
+  if (cls) span.className = cls;
+  span.textContent = msg + "\n";
+  logEl.appendChild(span);
+  console.log(msg);
+}
+
+async function main() {
+  if (!navigator.gpu) {
+    log("FAIL: navigator.gpu is undefined — browser has no WebGPU", "fail");
+    summaryEl.textContent = "NO WEBGPU";
+    window.__BROTLIG_RESULT__ = { status: "no-webgpu" };
+    return;
+  }
+  log("navigator.gpu present", "info");
+
+  let mod;
+  try {
+    mod = await import("./dist/src/index.js");
+  } catch (e) {
+    log("FAIL: import failed: " + e.message, "fail");
+    summaryEl.textContent = "IMPORT FAIL";
+    window.__BROTLIG_RESULT__ = { status: "import-fail", error: String(e) };
+    return;
+  }
+  const { decode, BrotligStreamDecoder, requestBrotligDevice } = mod;
+  log("module loaded: decode, BrotligStreamDecoder, requestBrotligDevice", "info");
+
+  try {
+    const dev = await requestBrotligDevice();
+    log("device acquired; features: " + [...dev.features].join(","), "info");
+  } catch (e) {
+    log("FAIL: device acquisition: " + e.message, "fail");
+    summaryEl.textContent = "NO DEVICE";
+    window.__BROTLIG_RESULT__ = { status: "no-device", error: String(e) };
+    return;
+  }
+
+  const fetchBytes = async (p) => new Uint8Array(await (await fetch(p)).arrayBuffer());
+  const fixtures = [
+    ["tiny",   "test/fixtures/tiny.brotlig",   "test/fixtures/tiny.bin.golden"],
+    ["small",  "test/fixtures/small.brotlig",  "test/fixtures/small.txt.golden"],
+    ["medium", "test/fixtures/medium.brotlig", "test/fixtures/medium.bin.golden"],
+    ["bc1",    "test/fixtures/bc1.brotlig",    "test/fixtures/bc1.raw.golden"],
+    ["bc2",    "test/fixtures/bc2.brotlig",    "test/fixtures/bc2.raw.golden"],
+    ["bc3",    "test/fixtures/bc3.brotlig",    "test/fixtures/bc3.raw.golden"],
+    ["bc4",    "test/fixtures/bc4.brotlig",    "test/fixtures/bc4.raw.golden"],
+    ["bc5",    "test/fixtures/bc5.brotlig",    "test/fixtures/bc5.raw.golden"],
+  ];
+
+  function bufEq(a, b) {
+    if (a.length !== b.length) return { ok: false, reason: `size ${a.length} vs ${b.length}` };
+    for (let i = 0; i < a.length; i++)
+      if (a[i] !== b[i]) return { ok: false, reason: `byte ${i}: got ${a[i]} exp ${b[i]}` };
+    return { ok: true };
+  }
+
+  let pass = 0, fail = 0;
+  const results = [];
+
+  // ONE-SHOT phase — use a fresh decoder per call to isolate from any
+  // cached-decoder state leakage.
+  async function decodeFresh(inp) {
+    const dec = await BrotligStreamDecoder.create();
+    const a = await dec.push(inp);
+    const b = await dec.end();
+    dec.destroy();
+    const total = a.length + b.length;
+    const joined = new Uint8Array(total);
+    joined.set(a, 0); joined.set(b, a.length);
+    return joined;
+  }
+  for (const [name, b, g] of fixtures) {
+    const t0 = performance.now();
+    try {
+      const [inp, exp] = await Promise.all([fetchBytes(b), fetchBytes(g)]);
+      const out = await decodeFresh(inp);
+      const r = bufEq(out, exp);
+      if (r.ok) {
+        log(`  PASS  one-shot ${name}  ${out.length}B in ${(performance.now()-t0).toFixed(0)}ms`, "pass");
+        pass++; results.push({ name: `one-shot ${name}`, ok: true });
+      } else {
+        log(`  FAIL  one-shot ${name}: ${r.reason}`, "fail");
+        fail++; results.push({ name: `one-shot ${name}`, ok: false, reason: r.reason });
+      }
+    } catch (e) {
+      log(`  FAIL  one-shot ${name}: ${e.message}`, "fail");
+      fail++; results.push({ name: `one-shot ${name}`, ok: false, reason: String(e) });
+    }
+  }
+
+  // STREAMING phase — exercise chunked push across all fixtures and chunk sizes.
+  async function decodeChunked(input, chunk) {
+    const dec = await BrotligStreamDecoder.create();
+    const parts = [];
+    for (let i = 0; i < input.length; i += chunk) {
+      const out = await dec.push(input.subarray(i, Math.min(i + chunk, input.length)));
+      if (out.length) parts.push(out);
+    }
+    const tail = await dec.end();
+    if (tail.length) parts.push(tail);
+    dec.destroy();
+    let total = 0; for (const p of parts) total += p.length;
+    const joined = new Uint8Array(total);
+    let off = 0; for (const p of parts) { joined.set(p, off); off += p.length; }
+    return joined;
+  }
+
+  const streamingCases = [
+    ["tiny",   1],
+    ["small",  16],
+    ["small",  1],
+    ["medium", 65536],
+    ["medium", 4096],
+    ["medium", 1024],
+    ["bc3",    64],
+    ["bc5",    64],
+  ];
+  for (const [name, chunk] of streamingCases) {
+    const fx = fixtures.find((f) => f[0] === name);
+    if (!fx) continue;
+    const t0 = performance.now();
+    try {
+      const [inp, exp] = await Promise.all([fetchBytes(fx[1]), fetchBytes(fx[2])]);
+      const out = await decodeChunked(inp, chunk);
+      const r = bufEq(out, exp);
+      if (r.ok) {
+        log(`  PASS  stream ${name} chunk=${chunk}  ${out.length}B in ${(performance.now()-t0).toFixed(0)}ms`, "pass");
+        pass++; results.push({ name: `stream ${name} chunk=${chunk}`, ok: true });
+      } else {
+        log(`  FAIL  stream ${name} chunk=${chunk}: ${r.reason}`, "fail");
+        fail++; results.push({ name: `stream ${name} chunk=${chunk}`, ok: false, reason: r.reason });
+      }
+    } catch (e) {
+      log(`  FAIL  stream ${name} chunk=${chunk}: ${e.message}`, "fail");
+      fail++; results.push({ name: `stream ${name} chunk=${chunk}`, ok: false, reason: String(e) });
+    }
+  }
+
+  const summary = `${pass} passed, ${fail} failed (${pass + fail} total)`;
+  log("\n" + summary, fail ? "fail" : "pass");
+  summaryEl.textContent = summary;
+  summaryEl.className = fail ? "fail" : "pass";
+  window.__BROTLIG_RESULT__ = { status: fail ? "fail" : "pass", pass, fail, results };
+}
+
+main().catch((e) => {
+  log("FATAL: " + e.message + "\n" + e.stack, "fail");
+  summaryEl.textContent = "FATAL";
+  window.__BROTLIG_RESULT__ = { status: "fatal", error: String(e) };
+});
+</script>
+</body>
+</html>

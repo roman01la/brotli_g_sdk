@@ -456,7 +456,7 @@ export class BrotligStreamDecoder {
       if (cur.pagesUploaded <= cur.pageCursor) break;
 
       const pageLimit = cur.pagesUploaded;
-      if (process.env.BROTLIG_DEBUG) {
+      if (typeof process !== "undefined" && process.env?.BROTLIG_DEBUG) {
         // eslint-disable-next-line no-console
         console.log(
           `[brotlig] dispatch pageLimit=${pageLimit} pagesUploaded=${cur.pagesUploaded} numPages=${numPages} pageCursor=${cur.pageCursor}`,

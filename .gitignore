@@ -30,3 +30,4 @@ bin/
 external/brotli/
 webgpu/node_modules/
 webgpu/dist/
+webgpu/dist/
