@@ -18,9 +18,25 @@
 // THE SOFTWARE.
 
 
+// BROTLIG_CPU_ONLY: portable build that drops the D3D12 GPU decoder path so
+// the CLI can be compiled on non-Windows hosts to generate golden fixtures
+// for the WebGPU port. When defined, no Windows.h / d3d12 headers are pulled
+// in and the -gpu flag is rejected.
+#ifndef BROTLIG_CPU_ONLY
 #define NOMINMAX
 #include <Windows.h>
+#else
+// Shims for Windows macros used throughout this sample CLI.
+#ifndef TRUE
+#define TRUE 1
+#endif
+#ifndef FALSE
+#define FALSE 0
+#endif
+#endif
 #include <cstdio>
+#include <cstdarg>
+#include <cstring>
 #include <cstdint>
 #include <string>
 #include <stdexcept>
@@ -29,7 +45,16 @@
 
 #include "BrotliG.h"
 
-#ifdef USE_GPU_DECOMPRESSION
+#ifdef BROTLIG_CPU_ONLY
+// Standard std::exception has no (const char*) ctor; the original CLI
+// relies on an MSVC extension. Redirect those throws to std::runtime_error
+// on portable builds so we can compile on clang/gcc.
+#define BROTLIG_CLI_THROW(msg) throw std::runtime_error(msg)
+#else
+#define BROTLIG_CLI_THROW(msg) throw std::exception(msg)
+#endif
+
+#if defined(USE_GPU_DECOMPRESSION) && !defined(BROTLIG_CPU_ONLY)
 #include "BrotligGPUDecoder.h"
 #endif
 
@@ -328,8 +353,10 @@ void ParseCommandLine(int argCount, char* args[], std::string& srcFilePath, std:
 
 bool keypressed()
 {
+#ifndef BROTLIG_CPU_ONLY
     if (GetAsyncKeyState(VK_ESCAPE) & 0x01)
         return true;
+#endif
     return false;
 }
 
@@ -341,9 +368,13 @@ void printStatus(const char* status, ...)
     char text[MAX_STATUS_STRING_BUFFER];
     va_list list;
     va_start(list, status);
+#ifdef BROTLIG_CPU_ONLY
+    vsnprintf(text, MAX_STATUS_STRING_BUFFER, status, list);
+#else
     vsprintf_s(text, MAX_STATUS_STRING_BUFFER, status, list);
+#endif
     va_end(list);
-    printf(text);
+    printf("%s", text);
 }
 
 // Called internally by the Encoder a % value ranging from 0.0% to 100% is passed in 
@@ -418,7 +449,7 @@ int main(int argc, char* argv[])
                 }
 
                 if (!ReadBinaryFile(srcFilePath, src_data, &src_size))
-                    throw std::exception("File Not Found.");
+                    BROTLIG_CLI_THROW("File Not Found.");
 
                 // DeCompress the data
                 output_size = BrotliG::DecompressedSize(src_data);
@@ -439,7 +470,7 @@ int main(int argc, char* argv[])
                         double observedTime = 0.0;
 
                         if (DecodeGPU(pParams.use_warp, src_size, src_data, &output_size, output_data, observedTime) != BROTLIG_OK)
-                            throw std::exception("BrotliG GPU Decoder Failed or Aborted.");
+                            BROTLIG_CLI_THROW("BrotliG GPU Decoder Failed or Aborted.");
 
                         deltaTime += observedTime;
                         ++rep;
@@ -461,7 +492,7 @@ int main(int argc, char* argv[])
                         auto start = std::chrono::high_resolution_clock::now();
 
                         if (BrotliG::DecodeCPU(src_size, src_data, &output_size, output_data, pParams.verbose ? processFeedback : nullptr) != BROTLIG_OK)
-                            throw std::exception("BrotliG CPU Decoder Failed or Aborted.");
+                            BROTLIG_CLI_THROW("BrotliG CPU Decoder Failed or Aborted.");
 
                         auto end = std::chrono::high_resolution_clock::now();
 
@@ -472,7 +503,7 @@ int main(int argc, char* argv[])
                 
                 printf("Saving decompressed file %s\n", dstFilePath.c_str());
                 if (!WriteBinaryFile(dstFilePath, output_data, output_size))
-                    throw std::exception("File Not Saved.");
+                    BROTLIG_CLI_THROW("File Not Saved.");
             }
             else {
 
@@ -480,10 +511,10 @@ int main(int argc, char* argv[])
                 // Brotli-G CPU compressor
                 //-----------------------
                 if (pParams.page_size < BROTLIG_MIN_PAGE_SIZE)
-                    throw std::exception("Page Size is less than minimum allowed page size.");
+                    BROTLIG_CLI_THROW("Page Size is less than minimum allowed page size.");
 
                 if (pParams.page_size > BROTLIG_MAX_PAGE_SIZE)
-                    throw std::exception("Page Size exceeds maximum allowed page size.");
+                    BROTLIG_CLI_THROW("Page Size exceeds maximum allowed page size.");
 
                 processMessage = "BrotliG CPU compressor";
 
@@ -491,7 +522,7 @@ int main(int argc, char* argv[])
                 dstFilePath.append(BROTLIG_FILE_EXTENSION);
 
                 if (!ReadBinaryFile(srcFilePath, src_data, &src_size))
-                    throw std::exception("File Not Found.");
+                    BROTLIG_CLI_THROW("File Not Found.");
 
                 output_size = BrotliG::MaxCompressedSize(src_size);
                 output_data = new uint8_t[output_size];
@@ -516,7 +547,7 @@ int main(int argc, char* argv[])
                     printf("Round %d of %d\n", rep + 1, pParams.num_repeat);
                     auto start = std::chrono::high_resolution_clock::now();
                     if (BrotliG::Encode(src_size, src_data, &output_size, output_data, pParams.page_size, dcParams, pParams.verbose ? processFeedback : nullptr) != BROTLIG_OK)
-                        throw std::exception("BrotliG Encoder Failed or Aborted.");
+                        BROTLIG_CLI_THROW("BrotliG Encoder Failed or Aborted.");
                     auto end = std::chrono::high_resolution_clock::now();
 
                     deltaTime += static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
@@ -525,7 +556,7 @@ int main(int argc, char* argv[])
 
                 printf("\nSaving compressed file %s\n", dstFilePath.c_str());
                 if (!WriteBinaryFile(dstFilePath, output_data, output_size))
-                    throw std::exception("File Not Saved.");
+                    BROTLIG_CLI_THROW("File Not Saved.");
                 isCompressed = true;
             }
         }
@@ -547,7 +578,7 @@ int main(int argc, char* argv[])
                 }
 
                 if (!ReadBinaryFile(srcFilePath, src_data, &src_size))
-                    throw std::exception("File Not Found.");
+                    BROTLIG_CLI_THROW("File Not Found.");
 
                 // DeCompress the data
                 size_t output_sizet = (size_t)pParams.brotli_decode_output_size;
@@ -562,10 +593,10 @@ int main(int argc, char* argv[])
                     auto end = std::chrono::high_resolution_clock::now();
 
                     if (result == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT)
-                        throw std::exception("Brotli Decoder Failed. Set larger output buffer size.");
+                        BROTLIG_CLI_THROW("Brotli Decoder Failed. Set larger output buffer size.");
                     else if (result == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT
                         || result == BROTLI_DECODER_RESULT_ERROR)
-                        throw std::exception("Brotil Decoder Failed. Input file may be corrupted.");
+                        BROTLIG_CLI_THROW("Brotil Decoder Failed. Input file may be corrupted.");
 
                     deltaTime += static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
                     output_size = (uint32_t)output_sizet;
@@ -575,7 +606,7 @@ int main(int argc, char* argv[])
                 // Save the uncompressed file
                 printf("\nSaving decompressed file %s\n", dstFilePath.c_str());
                 if (!WriteBinaryFile(dstFilePath, output_data, output_size))
-                    throw std::exception("File Not Saved.");
+                    BROTLIG_CLI_THROW("File Not Saved.");
 
             }
             else {
@@ -589,7 +620,7 @@ int main(int argc, char* argv[])
                 dstFilePath.append(BROTLI_FILE_EXTENSION);
 
                 if (!ReadBinaryFile(srcFilePath, src_data, &src_size))
-                    throw std::exception("File Not Found.");
+                    BROTLIG_CLI_THROW("File Not Found.");
 
                 size_t output_sizet = BrotliEncoderMaxCompressedSize(src_size);
                 uint8_t* output_data = new uint8_t[output_sizet];
@@ -607,7 +638,7 @@ int main(int argc, char* argv[])
                         &output_sizet,
                         output_data))
                     {
-                        throw std::exception("Brotli Encoder Failed or Aborted.");
+                        BROTLIG_CLI_THROW("Brotli Encoder Failed or Aborted.");
                     }
                     auto end = std::chrono::high_resolution_clock::now();
 
@@ -618,7 +649,7 @@ int main(int argc, char* argv[])
 
                 printf("\nSaving compressed file %s\n", dstFilePath.c_str());
                 if (!WriteBinaryFile(dstFilePath, output_data, output_size))
-                    throw std::exception("File Not Saved.");
+                    BROTLIG_CLI_THROW("File Not Saved.");
                 isCompressed = true;
             }
         }

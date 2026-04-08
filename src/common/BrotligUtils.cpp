@@ -60,6 +60,10 @@ uint32_t BrotliG::Mask32(uint32_t n)
     return (1u << n) - 1;
 }
 
+#ifndef _WIN32
+#include <thread>
+#endif
+
 uint32_t BrotliG::GetNumberOfProcessorsThreads()
 {
 #ifndef _WIN32

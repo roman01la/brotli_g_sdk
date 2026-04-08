@@ -21,6 +21,9 @@ link_directories(
     ${CMAKE_BINARY_DIR}/lib         # link in static libs 
     )
 
+# The original D3D12-based CLI is Windows-only. The portable CPU-only
+# variant (brotlig_cpu_cli) is defined below and builds on all platforms.
+if (WIN32)
 add_executable(brotlig_cli)
 
 if (OPTION_SAMPLE_INCLUDE_BROTLI)
@@ -65,14 +68,33 @@ target_link_libraries(brotlig_cli
 )
 
 set_target_properties(brotlig_cli
-     PROPERTIES 
+     PROPERTIES
      OUTPUT_NAME "brotlig"
      VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$(Configuration)"
     )
-	
+
 add_custom_command(TARGET brotlig_cli POST_BUILD
 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PROJECT_SOURCE_DIR}/src/decoder/BrotliGCompute.hlsl" $<TARGET_FILE_DIR:brotlig_cli>
 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PROJECT_SOURCE_DIR}/sample/external/dxc_2021_12_08/bin/x64/dxil.dll" $<TARGET_FILE_DIR:brotlig_cli>
 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PROJECT_SOURCE_DIR}/sample/external/dxc_2021_12_08/bin/x64/dxcompiler.dll" $<TARGET_FILE_DIR:brotlig_cli>
 )
+endif() # WIN32
+
+# CPU-only portable CLI variant. Builds on all platforms; used to generate
+# golden fixtures for the WebGPU decoder port. No D3D12 / dxc dependencies.
+add_executable(brotlig_cpu_cli brotlig_cli.cpp)
+target_compile_definitions(brotlig_cpu_cli PRIVATE BROTLIG_CPU_ONLY)
+if (OPTION_SAMPLE_INCLUDE_BROTLI)
+    target_compile_definitions(brotlig_cpu_cli PRIVATE USE_BROTLI_CODEC)
+endif()
+target_include_directories(brotlig_cpu_cli PRIVATE
+    ./
+    ${PROJECT_SOURCE_DIR}/external/brotli/c/include
+    ${PROJECT_SOURCE_DIR}/inc
+    ${PROJECT_SOURCE_DIR}/inc/common
+    ${PROJECT_SOURCE_DIR}/inc/decoder
+    ${PROJECT_SOURCE_DIR}/inc/encoder
+)
+target_link_libraries(brotlig_cpu_cli PRIVATE ${DEPS})
+set_target_properties(brotlig_cpu_cli PROPERTIES OUTPUT_NAME "brotlig_cpu")
 

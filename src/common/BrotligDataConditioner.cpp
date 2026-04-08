@@ -128,6 +128,6 @@ void BrotliG::Condition(uint32_t inSize, const uint8_t* inData, BrotligDatacondi
     case BROTLIG_DATA_FORMAT_BC4:
     case BROTLIG_DATA_FORMAT_BC5: return ConditionBC1_5(inSize, inData, params, outSize, outData);
     default:
-        throw std::exception("Brotli-G preconditioning unrecognized format");
+        throw std::runtime_error("Brotli-G preconditioning unrecognized format");
     }
 }

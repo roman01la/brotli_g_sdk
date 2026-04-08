@@ -169,7 +169,7 @@ void BuildHuffman(uint32_t* hist, size_t alphabet_size, uint16_t codes[], uint8_
     };
 
     // Count the number for codes for each length
-    for each (BrotligHuffmanNodePtr node in nodeList) ++blCounts[node->depth];
+    for (BrotligHuffmanNodePtr node : nodeList) ++blCounts[node->depth];
 
     // Find the numerical values of the smallest code for each code length
     uint16_t code = 0;
@@ -179,7 +179,7 @@ void BuildHuffman(uint32_t* hist, size_t alphabet_size, uint16_t codes[], uint8_
 
     // Assign numerical values to all codes using consecutive values for all codes of the same length
     // with the base values determined by the previous step.
-    for each (BrotligHuffmanNodePtr node in nodeList)
+    for (BrotligHuffmanNodePtr node : nodeList)
     {
         codelens[node->symbol] = node->depth;
         codes[node->symbol] = BrotligReverseBits(node->depth, next_code[node->depth]++);
@@ -348,7 +348,7 @@ void BrotliG::BuildStoreHuffmanTable(
             writer.Append((uint32_t)max_bits, (uint32_t)s4[3], true);
             break;
         default:
-            throw std::exception("Incorrect num symbols for simple huffman tree.");
+            throw std::runtime_error("Incorrect num symbols for simple huffman tree.");
         }
 
         writer.BSReset();

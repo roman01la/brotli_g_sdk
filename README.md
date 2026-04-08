@@ -96,3 +96,7 @@ Using the sample:
 * BrotliG cpu deccompression: `brotlig.exe <filepath>.brotlig`
 * BrotliG gpu decompression:  `brotlig.exe -gpu <filepath>.brotlig`
 * Help:                       `brotlig.exe` 
+
+## WebGPU port
+
+An in-progress WebGPU/WGSL port of the GPU decoder lives under [`webgpu/`](webgpu/). It is a self-contained TypeScript package (`@brotlig/webgpu`) targeting Chrome stable and Node 22+ (via the `webgpu` npm package / Dawn). The WGSL shader is not yet ported from `src/decoder/BrotliGCompute.hlsl`; the package currently ships the host skeleton, streaming decoder API shape, and scaffolding only. See `webgpu/README.md` for details.

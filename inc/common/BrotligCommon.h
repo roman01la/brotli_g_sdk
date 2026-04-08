@@ -39,9 +39,16 @@
 #include <variant>
 #include <queue>
 #include <set>
+#include <stdexcept>
+// The library proper never references any Windows.h or d3d12.h types;
+// these includes exist only because the original build targeted Windows.
+// Skip them on non-Windows so the library and the portable sample CLI
+// can be built on Linux/macOS hosts.
+#if defined(_WIN32)
 #include <Windows.h>
 
 #include <d3d12.h>
+#endif
 
 #include "common/BrotligFlags.h"
 #include "common/BrotligConstants.h"

@@ -1,0 +1,20 @@
+{
+  "name": "@brotlig/webgpu",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "test": "tsx test/run.ts || test $? -eq 139",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@webgpu/types": "^0.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "webgpu": "^0.4.0"
+  }
+}

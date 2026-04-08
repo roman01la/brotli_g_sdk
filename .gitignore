@@ -23,3 +23,10 @@ CMakeFiles
 .vs
 
 !/external/cmake/customtargets/*.cmake
+
+# WebGPU port
+build/
+bin/
+external/brotli/
+webgpu/node_modules/
+webgpu/dist/

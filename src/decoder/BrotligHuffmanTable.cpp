@@ -200,6 +200,6 @@ void BrotliG::LoadHuffmanTable(
         break;
     }
     default:
-        throw std::exception("Error loading huffman table. Incorrect tree type.");
+        throw std::runtime_error("Error loading huffman table. Incorrect tree type.");
     }
 }
