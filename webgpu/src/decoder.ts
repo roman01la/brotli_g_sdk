@@ -486,7 +486,11 @@ export class BrotligStreamDecoder {
     meta[2] = cur.pageCursor > 0 ? 1 : 0; // resume flag
     meta[3] = 0;
     meta[4] = cur.inputBase; // rptr
-    meta[5] = cur.outputBase + cur.producedBytes; // wptr
+    // wptr: shader computes pageWptr = streamWptr + page_index * pageSize,
+    // so streamWptr must be the stream's absolute output base (NOT a running
+    // cursor). Pages already decoded by prior dispatches are addressed via
+    // page_index, which the host restores via meta[6] (pageCursor).
+    meta[5] = cur.outputBase; // wptr
     meta[6] = cur.pageCursor; // pageCursor
     meta[7] = cur.stateSlot * STATE_STRIDE_BYTES; // savedStateOffset
     this.device.queue.writeBuffer(this.metaBuf, 0, meta.buffer, 0, META_BYTES_FOR_STREAMS(1));
